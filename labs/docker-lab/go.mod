@@ -1,4 +1,4 @@
-module github.com/superplayground3000/learn-spire/labs/entry-lab
+module github.com/superplayground3000/learn-spire/labs/docker-lab
 
 go 1.26
 

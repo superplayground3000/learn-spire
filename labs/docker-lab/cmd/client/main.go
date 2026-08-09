@@ -6,9 +6,9 @@
 // The client reads no certificate file and holds no API key. It asks the local
 // SPIRE agent for an identity, and it accepts one server SPIFFE ID.
 //
-// The same binary runs under UID 10002 and under UID 10003. The client never
-// selects its own identity, so the UID alone decides which SPIFFE ID it gets.
-// The intruder demo uses this property.
+// The same binary runs in the client container and in the intruder container.
+// The client never selects its own identity. The container label alone
+// decides which SPIFFE ID it gets. The intruder demo uses this property.
 package main
 
 import (
@@ -32,7 +32,7 @@ const (
 	// SPIFFE ID stops the TLS handshake, and the client sends no request.
 	expectedServerID = "spiffe://lab.local/server"
 
-	// The node container also answers to the network name "server".
+	// The compose service name "server" resolves to the server container.
 	serverURL = "https://server:8443/hello"
 
 	// This value is the time limit for the first SVID. If the agent gives no
@@ -90,12 +90,12 @@ func run() error {
 // newSource gets the identity of this workload from the local SPIRE agent.
 func newSource() (*workloadapi.X509Source, error) {
 	// The address of the Workload API comes from the environment variable
-	// SPIFFE_ENDPOINT_SOCKET. The node image sets it to
+	// SPIFFE_ENDPOINT_SOCKET. The workload image sets it to
 	// unix:///run/spire/agent.sock. The code names no socket path.
 	ctx, cancel := context.WithTimeout(context.Background(), firstSVIDTimeout)
 	defer cancel()
 
-	// The client uses no Workload API logger. The output is the §16 demo
+	// The client uses no Workload API logger. The output is the demo
 	// transcript, and a failure already surfaces as the returned error.
 	source, err := workloadapi.NewX509Source(ctx)
 	if err != nil {
@@ -137,7 +137,6 @@ func get(client *http.Client) error {
 	log.Print("mTLS handshake: SUCCESS")
 	log.Printf("authenticated server: %s", authenticatedServer)
 	// The serial identifies the exact certificate that the server presented.
-	// The rotation demo compares it across runs.
 	log.Printf("server certificate serial: %X", response.TLS.PeerCertificates[0].SerialNumber)
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxBodyBytes))

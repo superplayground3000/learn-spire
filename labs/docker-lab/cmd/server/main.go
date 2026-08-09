@@ -4,8 +4,9 @@
 //	Workload API -> X509-SVID -> mTLS listener -> peer SPIFFE ID check
 //
 // The server reads no certificate file and holds no shared secret. It asks the
-// local SPIRE agent for an identity. SPIRE decides that identity from the UID
-// of this process. The server then accepts one peer SPIFFE ID, and no other.
+// local SPIRE agent for an identity. SPIRE decides that identity from the
+// label of this container. The server then accepts one peer SPIFFE ID, and no
+// other.
 package main
 
 import (
@@ -30,7 +31,7 @@ import (
 const (
 	// This constant names the identity that this server must receive. The
 	// Workload API is the only source of the real identity. This constant
-	// makes a wrong UID easy to see in the log.
+	// makes a wrong container label easy to see in the log.
 	expectedServerID = "spiffe://lab.local/server"
 
 	// The only peer this server accepts. The TLS handshake refuses a different
@@ -109,7 +110,7 @@ func run() error {
 // newSource gets the identity of this workload from the local SPIRE agent.
 func newSource(serverID spiffeid.ID) (*workloadapi.X509Source, error) {
 	// The address of the Workload API comes from the environment variable
-	// SPIFFE_ENDPOINT_SOCKET. The node image sets it to
+	// SPIFFE_ENDPOINT_SOCKET. The workload image sets it to
 	// unix:///run/spire/agent.sock. The code names no socket path.
 	ctx, cancel := context.WithTimeout(context.Background(), firstSVIDTimeout)
 	defer cancel()
@@ -130,12 +131,12 @@ func newSource(serverID spiffeid.ID) (*workloadapi.X509Source, error) {
 	}
 	log.Printf("X509-SVID received from the Workload API: %s", svid.ID)
 
-	// SPIRE maps the UID of this process to a SPIFFE ID. If the ID is wrong,
-	// the server runs under the wrong UID. The client then refuses this
-	// server. Therefore the server stops and reports the cause.
+	// SPIRE maps the label of this container to a SPIFFE ID. If the ID is
+	// wrong, the container carries the wrong label. The client then refuses
+	// this server. Therefore the server stops and reports the cause.
 	if svid.ID != serverID {
 		source.Close()
-		return nil, fmt.Errorf("the received identity is %s, not %s: check the UID of this process", svid.ID, serverID)
+		return nil, fmt.Errorf("the received identity is %s, not %s: check the label of this container", svid.ID, serverID)
 	}
 	return source, nil
 }
