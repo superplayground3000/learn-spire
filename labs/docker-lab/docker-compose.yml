@@ -1,0 +1,147 @@
+name: spire-docker-lab
+
+# Every workload service starts from this block. The four workloads share one
+# image, one socket mount and one network. Only the label, the profile and the
+# command are different. The label alone decides the identity, and that is the
+# point of the lab.
+x-workload: &workload
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    target: workload
+  image: spire-docker-lab-workload:1.15.2
+  depends_on:
+    - spire-agent
+  environment:
+    SPIFFE_ENDPOINT_SOCKET: "unix:///run/spire/agent.sock"
+  volumes:
+    # Read-only: a workload connects to the socket, but it must not be able
+    # to delete or replace the socket for the other workloads.
+    - spire-agent-socket:/run/spire:ro
+  networks:
+    # The Go client asks for https://server:8443/hello. A service name is
+    # always a network alias, so the name "server" resolves.
+    lab: {}
+
+services:
+  # Control plane. The official image is scratch-based. It holds no shell and
+  # no package manager, only the static binary at /opt/spire/bin/spire-server.
+  # Run CLI commands against it with an explicit binary path, for example:
+  #   docker compose exec spire-server /opt/spire/bin/spire-server entry show
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:1.15.2
+    container_name: spire-server
+    # The image entrypoint is already "spire-server run"; this adds the flags.
+    command: ["-config", "/etc/spire/server/server.conf"]
+    volumes:
+      - ./infra/spire/server.conf:/etc/spire/server/server.conf:ro
+      - spire-server-data:/var/lib/spire/server
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    networks:
+      lab: {}
+
+  # The SPIRE agent has its own container now. In lab 1 the agent and the
+  # workloads shared one "node" container, because the unix attestor reads the
+  # UID of a local process. The docker attestor instead asks the Docker daemon
+  # about the caller's container, so the agent can stay alone.
+  spire-agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: agent
+    image: spire-docker-lab-agent:1.15.2
+    container_name: spire-agent
+    depends_on:
+      spire-server:
+        condition: service_healthy
+    # docker-init as PID 1 reaps the detached agent process and makes SIGTERM
+    # stop the container promptly.
+    init: true
+    # The attestor reads /proc/<pid>/ of the calling process. In its own PID
+    # namespace the agent cannot see a workload PID at all. The plugin reads
+    # /proc directly, so a bind mount cannot replace the host namespace.
+    pid: "host"
+    volumes:
+      - ./infra/spire/agent.conf:/opt/spire/conf/agent/agent.conf:ro
+      # The attestor asks the Docker daemon for the labels of the caller's
+      # container. Read-only is enough: the agent never changes a container.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The shared volume carries the Workload API socket and the bootstrap
+      # trust bundle to every workload container.
+      - spire-agent-socket:/run/spire
+    networks:
+      lab: {}
+
+  # --- Workloads -------------------------------------------------------------
+  # Each workload is its own container. The label "spiffe.lab/workload" makes
+  # the identity: a registration entry maps the label to a SPIFFE ID.
+  #
+  # The services below share one image and differ in label and command. None
+  # of them starts with a plain "docker compose up -d", because each one
+  # belongs to a profile.
+
+  # The long-running API server. Profile "workloads" keeps it out of "lab-up",
+  # which brings up the control plane only. A later step starts it.
+  server:
+    <<: *workload
+    profiles: ["workloads"]
+    labels:
+      spiffe.lab/workload: "server"
+    # The binary runs as PID 1 of this container. Nothing else runs in it.
+    command: ["/usr/local/bin/server"]
+
+  # The authorized client. Profile "demo" keeps it out of "docker compose up".
+  # A demo runs it with "docker compose run --rm client".
+  client:
+    <<: *workload
+    profiles: ["demo"]
+    labels:
+      spiffe.lab/workload: "client"
+    command: ["/usr/local/bin/client"]
+
+  # The intruder runs the same binary as the client. Its label is different, so
+  # SPIRE gives it a different SPIFFE ID. The server must refuse it.
+  intruder:
+    <<: *workload
+    profiles: ["demo"]
+    labels:
+      spiffe.lab/workload: "intruder"
+    command: ["/usr/local/bin/client"]
+
+  # This container gets no registration entry. It reaches the Workload API, but
+  # the agent gives it no SVID. The CLI shows that result directly.
+  unregistered:
+    <<: *workload
+    profiles: ["demo"]
+    labels:
+      spiffe.lab/workload: "unregistered"
+    command:
+      - /usr/local/bin/spire-agent
+      - api
+      - fetch
+      - x509
+      - -socketPath
+      - /run/spire/agent.sock
+      - -timeout
+      - 5s
+
+networks:
+  lab:
+    driver: bridge
+
+volumes:
+  # Keeps the CA key and datastore across container restarts.
+  # "make lab-down" (docker compose down -v) deletes it.
+  spire-server-data: {}
+
+  # Holds the Workload API socket and the bootstrap trust bundle. Every
+  # container that mounts it sees the same directory, so the workloads reach
+  # the agent socket. Mount the directory, never the socket file. For a
+  # missing file source, docker makes an empty file, and the agent then
+  # cannot bind its socket.
+  spire-agent-socket: {}

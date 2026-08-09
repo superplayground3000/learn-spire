@@ -1,0 +1,9 @@
+# The build stages need only go.mod, go.sum and cmd/. Do not include the
+# other files. Do not include runtime material from tmp/.
+tmp/
+scripts/
+infra/
+Makefile
+docker-compose.yml
+README.md
+.gitignore
