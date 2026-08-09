@@ -16,6 +16,10 @@
 #   make inspect    show the agents, the registration entries and the two
 #                   X509-SVIDs with their URI SAN and their expiry
 #
+#   make test-integration
+#                   destroy the lab, build it again, then assert the ten
+#                   security properties of section 20
+#
 # The first demo passes when the lab allows the request. The other two pass
 # when the lab denies the request.
 
@@ -34,6 +38,7 @@ help:
 	@echo 'make demo-intruder     - UID 10003 holds a valid SVID for the wrong identity. The server denies the handshake. The denial is the pass.'
 	@echo 'make demo-unregistered - UID 10004 has no registration entry. The agent issues no SVID. The denial is the pass.'
 	@echo 'make inspect    - show the agents, the registration entries and the server and client X509-SVIDs. It exports the SVIDs to tmp/, which git ignores.'
+	@echo 'make test-integration - CAUTION: this deletes all lab state. It builds a fresh lab. It asserts the ten security properties of section 20. It leaves the lab down.'
 
 build:
 	$(COMPOSE) pull --policy missing --ignore-buildable
@@ -76,9 +81,10 @@ demo-unregistered:
 inspect:
 	./scripts/inspect.sh
 
-# --- Later phases -----------------------------------------------------------
-# The integration tests are not part of this phase yet.
+# --- Integration test --------------------------------------------------------
+# The test runs its own full cycle: lab-down, lab-up, the assertions, lab-down.
+# So it needs no running lab, and it leaves no lab behind. It exits non-zero
+# when the lab does not enforce one security property or more.
 
 test-integration:
-	@echo 'make $@: not implemented yet'
-	@exit 1
+	./scripts/test-integration.sh
