@@ -22,6 +22,7 @@ make lab-up               # start SPIRE Server, attest the agent, register, run 
 make demo-ok              # UID 10002 authenticates and receives HTTP 200
 make demo-intruder        # UID 10003 holds a valid SVID for the wrong identity, and is denied
 make demo-unregistered    # UID 10004 has no entry, and receives no SVID
+make demo-rotation        # SPIRE replaces the SVID of the running server, which does not restart
 make inspect              # show agents, registration entries, and the two X509-SVIDs
 make test-integration     # rebuild the lab and assert the ten security properties
 make lab-down             # delete the lab and all of its runtime state
@@ -589,8 +590,89 @@ yourself:
 rm -rf tmp/svid
 ```
 
-### SVID rotation
+`make demo-rotation` writes certificates to `tmp/rotation/`. The certificates
+contain no private keys. Delete the directory when you finish.
 
-The identities in this lab live for one hour and SPIRE renews them without an
-application restart. Lab 1.5 will demonstrate that rotation with a short
-lifetime and a running client. The rotation ticket documents that work.
+### SVID rotation (Lab 1.5)
+
+The identities in this lab live for one hour. SPIRE replaces each identity
+before it expires. The application continues to run. This demo shows that
+change:
+
+```bash
+make demo-rotation
+```
+
+A one-hour lifetime is too long to watch. Therefore the demo uses a 60-second
+lifetime. It writes `-x509SVIDTTL 60` into the server registration entry. The
+lifetime belongs to one entry. `server.conf` does not change. Only the server
+entry changes. The demo restores the first value at the end, also after a
+failure or a Ctrl-C.
+
+The demo then shows three certificates:
+
+| Name | Where it comes from |
+| --- | --- |
+| SVID A | the identity that the server holds before the change |
+| SVID B | the replacement that the shorter lifetime causes |
+| SVID C | the rotation that time alone causes, at half of the lifetime |
+
+The serial number and the expiry change for each one. The demo proves that the
+same process keeps running through those changes:
+
+- The PID of the server process does not change.
+- The server log gets no second `server starting` line.
+- The client prints the serial of the certificate that the server **presents**
+  in the TLS handshake. That serial changes between the first request and the
+  last request.
+
+The last point is the strong one. The Workload API snapshots show what the
+agent serves. The presented serial shows what the running server really uses.
+The server took the new identity while it ran. It reloaded no `cert.pem`. It
+restarted no container. It read no new secret. The go-spiffe `X509Source`
+watches the Workload API and takes each new SVID by itself.
+
+A trimmed excerpt from a real run follows:
+
+```text
+=== Before the change ===
+server process PID    : 224
+SVID A serial   : 59768A3003DC10AB060E7CBC23DCFD60
+SVID A notAfter : Aug  9 08:45:47 2026 GMT
+
+=== Shorten the lifetime of the server entry ===
+  t+0s  serial 59768A3003DC10AB060E7CBC23DCFD60 (no change yet)
+  t+5s  new serial D3262BD8E841A28057FD9C788D692196
+SVID B notAfter : Aug  9 07:49:56 2026 GMT
+
+=== Wait for a rotation that only time causes ===
+  t+27s  new serial 739A538A947E0D0455A98FAC47EDDABA
+SVID C notAfter : Aug  9 07:50:21 2026 GMT
+
+=== Proof that the application kept running ===
+SVID B is expired now.
+mTLS handshake: SUCCESS
+HTTP status: 200
+
+server process PID before: 224
+server process PID after : 224 (unchanged)
+new 'server starting' lines in the server log: 0
+
+Rotation demo PASSED: the SVID changed, and the workload kept running.
+```
+
+Two details in that transcript need an explanation:
+
+1. The certificate lifetime reads 70 seconds, not 60. SPIRE dates each
+   certificate 10 seconds before it issues it. That allowance covers a small
+   difference between the clocks.
+2. SVID B arrives in about 5 seconds, long before half of the old lifetime. The
+   agent syncs the entries about every 5 seconds. A changed entry gets a new
+   SVID at the next sync. Only SVID C shows the pure time-driven rotation.
+
+The demo needs about two minutes. It keeps the three certificates in
+`tmp/rotation/`, so you can read one yourself:
+
+```bash
+openssl x509 -in tmp/rotation/svid-a.pem -noout -text
+```

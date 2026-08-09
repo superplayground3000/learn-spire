@@ -136,6 +136,9 @@ func get(client *http.Client) error {
 
 	log.Print("mTLS handshake: SUCCESS")
 	log.Printf("authenticated server: %s", authenticatedServer)
+	// The serial identifies the exact certificate that the server presented.
+	// The rotation demo compares it across runs.
+	log.Printf("server certificate serial: %X", response.TLS.PeerCertificates[0].SerialNumber)
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxBodyBytes))
 	if err != nil {
