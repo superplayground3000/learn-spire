@@ -2,7 +2,7 @@
 #
 # Working targets:
 #   make build      pull the SPIRE server image and build the lab node image
-#   make lab-up     start SPIRE Server + SPIRE Agent, attested and ready
+#   make lab-up     start SPIRE Server + SPIRE Agent, attested and registered
 #   make lab-down   destroy the lab, including all runtime state
 
 COMPOSE ?= docker compose
@@ -13,7 +13,7 @@ COMPOSE ?= docker compose
 
 help:
 	@echo 'make build      - pull/build lab images'
-	@echo 'make lab-up     - start the lab (idempotent; also re-attests the agent after a node container restart)'
+	@echo 'make lab-up     - start the lab and register the workload entries (idempotent; also re-attests the agent after a node container restart)'
 	@echo 'make lab-down   - stop the lab and delete runtime state'
 
 build:
@@ -23,13 +23,14 @@ build:
 lab-up: build
 	$(COMPOSE) up -d
 	./scripts/bootstrap.sh
+	./scripts/register.sh
 
 lab-down:
 	$(COMPOSE) down -v --remove-orphans
 
 # --- Later phases -----------------------------------------------------------
-# Registration entries, the Go workloads and the three demos are not part of
-# this phase yet.
+# The Go workloads, the three demos, inspect and the integration tests are not
+# part of this phase yet.
 
 demo demo-ok demo-intruder demo-unregistered inspect test-integration:
 	@echo 'make $@: not implemented yet'

@@ -1,5 +1,9 @@
 # learn-spire
 
+## Writing style
+
+All comments and all documents in this repository must obey the `/simple-english` skill (ASD-STE100 Simplified Technical English). Keep sentences short: max 20 words, or 25 in descriptive text. Use the active voice and simple tenses. Use one word with one meaning. Put the condition before the command.
+
 ## Agent skills
 
 ### Issue tracker
