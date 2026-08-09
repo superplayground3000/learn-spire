@@ -1,0 +1,55 @@
+name: spire-entry-lab
+
+services:
+  # Control plane. The official image is scratch-based: no shell, no package
+  # manager, just the statically linked binary at /opt/spire/bin/spire-server.
+  # Run CLI commands against it with an explicit binary path, for example:
+  #   docker compose exec spire-server /opt/spire/bin/spire-server entry show
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:1.15.2
+    container_name: spire-server
+    # The image entrypoint is already "spire-server run"; this adds the flags.
+    command: ["-config", "/etc/spire/server/server.conf"]
+    volumes:
+      - ./infra/spire/server.conf:/etc/spire/server/server.conf:ro
+      - spire-server-data:/var/lib/spire/server
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    networks:
+      lab: {}
+
+  # One Linux node: SPIRE agent plus (in later phases) the workloads running
+  # under UIDs 10001-10004.
+  node:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: spire-entry-lab-node:1.15.2
+    container_name: node
+    depends_on:
+      spire-server:
+        condition: service_healthy
+    # docker-init as PID 1 reaps the detached agent process and makes SIGTERM
+    # stop the container promptly.
+    init: true
+    volumes:
+      - ./infra/spire/agent.conf:/opt/spire/conf/agent/agent.conf:ro
+    networks:
+      lab:
+        aliases:
+          # The Go API server added in a later phase is reached at
+          # https://server:8443, so the node also answers to "server".
+          - server
+
+networks:
+  lab:
+    driver: bridge
+
+volumes:
+  # Keeps the CA key and datastore across container restarts.
+  # "make lab-down" (docker compose down -v) deletes it.
+  spire-server-data: {}

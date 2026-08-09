@@ -1,0 +1,4 @@
+# Scratch space for material exported from the running lab (SVIDs, bundles).
+# Nothing produced at runtime belongs in the repository.
+tmp/*
+!tmp/.gitkeep
