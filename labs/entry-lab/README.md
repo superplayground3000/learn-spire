@@ -520,9 +520,11 @@ If you can explain that sentence and those five lines, the lab succeeded.
 
 ---
 
-## Future Lab 2: Docker label attestation
+## Lab 2: Docker label attestation
 
-This section describes the next lab. It is not built yet.
+This lab is now built. See [../docker-lab/](../docker-lab/).
+
+This section describes the idea of that lab.
 
 Lab 1 uses the Linux UID as the runtime property. That choice is easy to see and
 easy to run. It also permits a wrong conclusion: that SPIFFE identity depends on
