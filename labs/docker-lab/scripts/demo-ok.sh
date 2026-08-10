@@ -105,8 +105,12 @@ require_line() {
   fi
 }
 
+# wait_for_request_log polls for the proof line and stores it in PROOF_LINE.
+# The caller then shows the same line that satisfied the wait. A second log
+# read after the wait can fail or match other traffic, so there is none.
 wait_for_request_log() {
   local since="$1" i lines
+  PROOF_LINE=""
   for ((i = 1; i <= PROOF_ATTEMPTS; i++)); do
     if ! lines="$(read_log_since "${since}" 2>&1)"; then
       log "ERROR: cannot read the log of the ${SERVER_SERVICE} service"
@@ -115,8 +119,8 @@ wait_for_request_log() {
     fi
     # -F keeps the dots in the SPIFFE ID literal. Plain grep reads the full
     # input, so pipefail sees no broken pipe.
-    if grep -F "GET /hello from authenticated client: ${CLIENT_ID}" \
-      >/dev/null <<<"${lines}"; then
+    if PROOF_LINE="$(grep -m1 -F \
+      "GET /hello from authenticated client: ${CLIENT_ID}" <<<"${lines}")"; then
       return 0
     fi
     if ((i < PROOF_ATTEMPTS)); then
@@ -178,9 +182,7 @@ main() {
     read_log_since "${mark}" 2>&1 || true
     return 1
   fi
-  local proof_line
-  proof_line="$(read_log_since "${mark}" 2>/dev/null | grep -m1 -F 'GET /hello' || true)"
-  log "server log: ${proof_line}"
+  log "server log: ${PROOF_LINE}"
 
   log ""
   log "client SPIFFE ID: ${CLIENT_ID}"

@@ -19,6 +19,8 @@
 #                           denial
 #   make demo               run the three demos in order
 #   make inspect            show the agents, the entries and the SVIDs
+#   make test-integration   destroy the lab, build it again, then assert the
+#                           ten security properties
 #   make lab-down           destroy the lab, including all runtime state
 #
 # "make lab-up" starts one long-running workload: the API server. The other
@@ -34,7 +36,7 @@ COMPOSE_ALL := $(COMPOSE) --profile workloads --profile demo
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build lab-up demo-ok demo-intruder demo-unregistered demo inspect lab-down
+.PHONY: help build lab-up demo-ok demo-intruder demo-unregistered demo inspect test-integration lab-down
 
 help:
 	@echo 'make build             - pull/build the lab images: SPIRE server, SPIRE agent, and the Go workloads'
@@ -44,6 +46,7 @@ help:
 	@echo 'make demo-unregistered - ask the Workload API from a container without an entry and check the denial'
 	@echo 'make demo              - run demo-ok, demo-intruder and demo-unregistered in that order'
 	@echo 'make inspect           - show the attested agents, the registration entries and the X509-SVIDs'
+	@echo 'make test-integration  - CAUTION: this deletes all lab state. It builds a fresh lab. It asserts the ten security properties. It leaves the lab down.'
 	@echo 'make lab-down          - stop the lab and delete runtime state'
 
 build:
@@ -85,6 +88,12 @@ demo:
 # Never commit the material.
 inspect:
 	COMPOSE="$(COMPOSE)" ./scripts/inspect.sh
+
+# The test runs its own full cycle: lab-down, lab-up, the assertions, lab-down.
+# So it needs no running lab, and it leaves no lab behind. It exits non-zero
+# when the lab does not enforce one security property or more.
+test-integration:
+	COMPOSE="$(COMPOSE)" ./scripts/test-integration.sh
 
 lab-down:
 	$(COMPOSE_ALL) down -v --remove-orphans
