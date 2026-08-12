@@ -6,6 +6,12 @@
 //
 // The body names the zone, for example "zone-lab backend zone-b OK". The body
 // differs per zone, so a test can prove which backend answered (property P6).
+//
+// The listen address is 127.0.0.1:8080 by default. Only the local Envoy reaches
+// the app. The LISTEN_ADDR environment variable changes the address. The zone-a
+// peer sets 0.0.0.0:8080, so the client reaches the peer over plain HTTP. This
+// call uses no mTLS and no gateway. It proves intra-zone plaintext (property
+// P10).
 package main
 
 import (
@@ -24,9 +30,13 @@ func main() {
 		zone = "unknown"
 	}
 
-	// Envoy connects on loopback. The app never binds a zone address, so no
-	// remote peer reaches the app directly.
-	addr := "127.0.0.1:8080"
+	// Envoy connects on loopback. The app binds loopback by default, so no
+	// remote peer reaches a backend app directly. The peer overrides LISTEN_ADDR
+	// with 0.0.0.0:8080, so the client reaches the peer over plain HTTP.
+	addr := os.Getenv("LISTEN_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:8080"
+	}
 	body := fmt.Sprintf("zone-lab backend %s OK\n", zone)
 
 	mux := http.NewServeMux()

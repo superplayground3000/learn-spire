@@ -51,6 +51,20 @@ start_backend_app() {
   log "  ${service}: backend app started"
 }
 
+# The zone-a peer runs the same backend binary. It binds 0.0.0.0:8080, so the
+# client reaches it over plain HTTP inside zone-a. The call uses no mTLS and no
+# gateway (property P10). The peer holds an SVID, but this path does not use it.
+start_peer_app() {
+  local service="zone-a-peer"
+  if proc_running "${service}" '/usr/local/bin/backend'; then
+    log "  ${service}: peer app already running"
+    return 0
+  fi
+  dc exec -d "${service}" bash -c \
+    'ZONE=zone-a-peer LISTEN_ADDR=0.0.0.0:8080 backend >>/var/log/lab/app.log 2>&1'
+  log "  ${service}: peer app started (plain HTTP on 0.0.0.0:8080)"
+}
+
 start_envoy() {
   local service="$1" config="$2"
   if proc_running "${service}" 'envoy -c'; then
@@ -91,12 +105,16 @@ main() {
     start_envoy "${service}" "${config}"
   done
 
+  log "=== Starting the zone-a peer plain-HTTP server (property P10) ==="
+  start_peer_app
+
   log "=== Waiting for the listeners ==="
   local fail=0
   wait_for_listener "zone-b-backend" 9001 || fail=1
   wait_for_listener "zone-c-backend" 9001 || fail=1
   wait_for_listener "zone-b-gateway" 9000 || fail=1
   wait_for_listener "zone-c-gateway" 9000 || fail=1
+  wait_for_listener "zone-a-peer" 8080 || fail=1
 
   if [[ "${fail}" -ne 0 ]]; then
     log "ERROR: one Envoy or more did not open its listener"
