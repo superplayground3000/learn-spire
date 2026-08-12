@@ -19,15 +19,16 @@
 
 COMPOSE ?= docker compose
 
-# The one-shot workloads sit in the "demo" profile. The build and the teardown
-# name that profile, so no profiled service is skipped.
-COMPOSE_ALL := $(COMPOSE) --profile demo
+# The one-shot workloads sit in the "demo" profile. The CoreDNS resolvers sit in
+# the "dns" profile. The build and the teardown name both profiles, so no
+# profiled service is skipped when pulling images or removing containers.
+COMPOSE_ALL := $(COMPOSE) --profile demo --profile dns
 
 .DEFAULT_GOAL := help
 
 .PHONY: help build lab-up demo demo-intruder demo-unregistered demo-bearer \
-        demo-latency demo-rotation demo-register inspect test-integration \
-        test-san-pin lab-down
+        demo-latency demo-rotation demo-register demo-dns inspect \
+        test-integration test-san-pin lab-down
 
 help:
 	@echo 'make build             - build the zone-lab image (SPIRE agent, Envoy, the two Go apps)'
@@ -40,6 +41,7 @@ help:
 	@echo 'make demo-latency      - the gateway-hop overhead number (teaching, not the green bar)'
 	@echo 'make demo-rotation     - the SDS rotation demo (outside the green bar)'
 	@echo 'make demo-register     - phase 2: a registration walk-through (accept, list, two refusals)'
+	@echo 'make demo-dns          - phase 2: a DNS resolution walk-through (self, peer, NXDOMAIN, bypass)'
 	@echo 'make inspect           - show agents, entries, SVIDs, and Envoy secrets'
 	@echo 'make lab-down          - stop the lab and delete all runtime state'
 
@@ -77,6 +79,9 @@ demo-rotation:
 
 demo-register:
 	COMPOSE="$(COMPOSE)" ./scripts/demo-register.sh
+
+demo-dns:
+	COMPOSE="$(COMPOSE)" ./scripts/demo-dns.sh
 
 inspect:
 	COMPOSE="$(COMPOSE)" ./scripts/inspect.sh

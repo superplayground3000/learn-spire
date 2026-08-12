@@ -162,6 +162,15 @@ main() {
   start_registrar "zone-b-backend" "zone-b" "backend" "10.20.0.50"
   start_registrar "zone-c-backend" "zone-c" "backend" "10.30.0.50"
 
+  # Start the CoreDNS resolvers last of all. The registry app above already
+  # rendered the view files to the registry-views volume. A CoreDNS file plugin
+  # with a missing file fails to load, so the views must exist first. The "dns"
+  # profile keeps these out of the plain "up -d", so this is their only start.
+  log "=== Starting the per-zone CoreDNS resolvers (phase 2, part B) ==="
+  dc --profile dns up -d coredns-a coredns-b coredns-c >/dev/null 2>&1 \
+    && log "  coredns-a, coredns-b, coredns-c started" \
+    || log "  ERROR: could not start the CoreDNS resolvers"
+
   log "All serving processes are up"
 }
 
