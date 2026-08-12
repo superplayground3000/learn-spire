@@ -75,6 +75,33 @@ start_envoy() {
   log "  ${service}: envoy started (${config})"
 }
 
+# start_registry_app starts the Go registry on 127.0.0.1:8081. Its Envoy
+# sidecar terminates mTLS and forwards to it. The env values set short lease and
+# reap times, so the lease tests run quickly.
+start_registry_app() {
+  local service="zone-registry"
+  if proc_running "${service}" '/usr/local/bin/registry'; then
+    log "  ${service}: registry app already running"
+    return 0
+  fi
+  dc exec -d "${service}" bash -c 'registry >>/var/log/lab/registry.log 2>&1'
+  log "  ${service}: registry app started (plain HTTP on 127.0.0.1:8081)"
+}
+
+# start_registrar runs a registrar loop inside a backend container. The loop
+# re-fetches the SVID, then renews the lease through the registry Envoy.
+start_registrar() {
+  local service="$1" zone="$2" svc="$3" ip="$4"
+  if proc_running "${service}" '/usr/local/bin/registrar'; then
+    log "  ${service}: registrar already running"
+    return 0
+  fi
+  dc exec -d "${service}" bash -c \
+    "REGISTRY_ADDR=zone-registry REGISTRY_PORT=9443 ZONE=${zone} SERVICE=${svc} IP=${ip} PORT=9001 INTERVAL=10 \
+     registrar >>/var/log/lab/registrar.log 2>&1"
+  log "  ${service}: registrar started (${svc}.${zone} -> ${ip})"
+}
+
 # wait_for_listener waits until the named container listens on the port.
 wait_for_listener() {
   local service="$1" port="$2" i
@@ -108,6 +135,10 @@ main() {
   log "=== Starting the zone-a peer plain-HTTP server (property P10) ==="
   start_peer_app
 
+  log "=== Starting the registry and its Envoy sidecar ==="
+  start_registry_app
+  start_envoy "zone-registry" "/etc/envoy/zone-registry-envoy.yaml"
+
   log "=== Waiting for the listeners ==="
   local fail=0
   wait_for_listener "zone-b-backend" 9001 || fail=1
@@ -115,6 +146,7 @@ main() {
   wait_for_listener "zone-b-gateway" 9000 || fail=1
   wait_for_listener "zone-c-gateway" 9000 || fail=1
   wait_for_listener "zone-a-peer" 8080 || fail=1
+  wait_for_listener "zone-registry" 9443 || fail=1
 
   if [[ "${fail}" -ne 0 ]]; then
     log "ERROR: one Envoy or more did not open its listener"
@@ -123,6 +155,13 @@ main() {
 
   # Give SDS a moment to deliver the secrets to every Envoy.
   sleep 3
+
+  # Start the registrars last. The registry Envoy must listen first, or the
+  # first renewal fails and retries on the next interval.
+  log "=== Starting the backend registrars (phase 2) ==="
+  start_registrar "zone-b-backend" "zone-b" "backend" "10.20.0.50"
+  start_registrar "zone-c-backend" "zone-c" "backend" "10.30.0.50"
+
   log "All serving processes are up"
 }
 

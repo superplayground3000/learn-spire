@@ -40,11 +40,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY cmd ./cmd
+COPY registry ./registry
 
 # CGO_ENABLED=0 makes static Linux binaries that run on the runtime image.
 # -trimpath keeps host paths out of the binaries, so builds stay reproducible.
 RUN CGO_ENABLED=0 go build -trimpath -o /out/backend ./cmd/backend \
- && CGO_ENABLED=0 go build -trimpath -o /out/client ./cmd/client
+ && CGO_ENABLED=0 go build -trimpath -o /out/client ./cmd/client \
+ && CGO_ENABLED=0 go build -trimpath -o /out/registry ./registry
 
 # --- The runtime image -------------------------------------------------------
 FROM debian:bookworm-slim
@@ -65,15 +67,21 @@ RUN ln -s /opt/spire/bin/spire-agent /usr/local/bin/spire-agent
 COPY --from=envoy /usr/local/bin/envoy /usr/local/bin/envoy
 RUN envoy --version >/dev/null && echo "envoy ok"
 
-# The two Go apps carry no certificate and no secret. Envoy handles all mTLS.
-COPY --from=gobuild /out/backend /out/client /usr/local/bin/
+# The Go apps carry no certificate and no secret. Envoy handles all mTLS. The
+# registry reads the caller identity only from the XFCC header its sidecar sets.
+COPY --from=gobuild /out/backend /out/client /out/registry /usr/local/bin/
+
+# The registrar loop renews a workload's lease with its own SVID. The two
+# backends run it. It re-fetches the SVID before each renewal.
+COPY registry/registrar.sh /usr/local/bin/registrar
+RUN chmod 0755 /usr/local/bin/registrar
 
 # /run/spire is the mount point of the shared socket volume. It holds the
 # Workload API socket and the bootstrap trust bundle. /var/log/envoy holds the
 # Envoy access log. /var/log/lab holds the agent and app logs.
 RUN mkdir -p /run/spire /var/log/envoy /var/log/lab /var/lib/spire/agent \
-      /opt/spire/conf/agent /opt/www \
- && chmod 0755 /run/spire
+      /opt/spire/conf/agent /opt/www /views \
+ && chmod 0755 /run/spire /views
 
 # The container only stays alive. bootstrap.sh or start-servers.sh starts the
 # real process inside it.

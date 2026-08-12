@@ -1,10 +1,11 @@
 name: zone-lab
 
-# Zone-lab, phase 1. The lab moves the enforcement point out of the app code
-# and into Envoy. Ten containers form three security zones plus one control
-# plane. One SPIRE agent uses docker:label attestation. The agent serves the
-# Workload API on a socket in a shared volume. That socket crosses the internal
-# zone networks, so a workload gets its identity without a route to the server.
+# Zone-lab. The lab moves the enforcement point out of the app code and into
+# Envoy. Three security zones plus one control plane. Phase 2 adds a management
+# plane (mgmt-a, mgmt-b, mgmt-c) and a registry that multi-homes on it.
+# One SPIRE agent uses docker:label attestation. The agent serves the Workload
+# API on a socket in a shared volume. That socket crosses the internal zone
+# networks, so a workload gets its identity without a route to the server.
 #
 # Trap 4: a workload needs no control network. Only the server and the agent
 # sit on control. The shared socket volume carries the Workload API.
@@ -82,6 +83,9 @@ services:
   # --- Zone B backend: on zone-b only ---------------------------------------
   # Envoy fronts the Go backend app on 127.0.0.1:8080. It admits only the
   # zone-b gateway identity, by a SAN pin and a network RBAC filter.
+  # The backend joins mgmt-b too. mgmt-b carries only registry traffic. It is a
+  # separate internal network, so it adds no cross-zone data path. The data
+  # plane stays on zone-b.
   zone-b-backend:
     <<: *node
     container_name: zone-lab-zone-b-backend
@@ -95,6 +99,7 @@ services:
       - ./conf/zone-b-backend-envoy.yaml:/etc/envoy/zone-b-backend-envoy.yaml:ro
     networks:
       zone-b: { ipv4_address: 10.20.0.50 }
+      mgmt-b: { ipv4_address: 10.50.0.50 }
 
   # --- Zone C gateway: dual-homed on zone-b and zone-c ----------------------
   # It admits only zone-b/backend at Layer 7. Zone A cannot reach it at all.
@@ -125,6 +130,31 @@ services:
       - ./conf/zone-c-backend-envoy.yaml:/etc/envoy/zone-c-backend-envoy.yaml:ro
     networks:
       zone-c: { ipv4_address: 10.30.0.50 }
+      mgmt-c: { ipv4_address: 10.60.0.50 }
+
+  # --- The registry: multi-homed on all three mgmt networks -----------------
+  # The registry is the only container on more than one mgmt network. It does
+  # not forward between them, so mgmt-a, mgmt-b, and mgmt-c stay isolated. A Go
+  # plain-HTTP server holds the records. Its Envoy sidecar terminates mTLS and
+  # sets the XFCC header. The registry reads the caller only from that header.
+  zone-registry:
+    <<: *node
+    container_name: zone-lab-zone-registry
+    hostname: zone-registry
+    labels:
+      spiffe.lab/workload: "zone-registry"
+    environment:
+      LEASE_TTL: "30"
+      REAP_INTERVAL: "5"
+      POLICY_JSON: '{"zone-a":["zone-b"],"zone-b":["zone-c"]}'
+    volumes:
+      - spire-agent-socket:/run/spire:ro
+      - ./conf/zone-registry-envoy.yaml:/etc/envoy/zone-registry-envoy.yaml:ro
+      - registry-views:/views
+    networks:
+      mgmt-a: { ipv4_address: 10.40.0.10 }
+      mgmt-b: { ipv4_address: 10.50.0.10 }
+      mgmt-c: { ipv4_address: 10.60.0.10 }
 
   # --- Zone A peer: the intra-zone plaintext target -------------------------
   # The client calls the peer over plain HTTP, with no mTLS and no gateway.
@@ -189,9 +219,25 @@ networks:
   zone-c:
     internal: true
     ipam: { config: [{ subnet: 10.30.0.0/24 }] }
+  # The management plane: one internal network per zone. The registry multi-homes
+  # on all three. A registering workload joins only its own zone's mgmt network.
+  # So a workload reaches the registry, but not a workload in another zone. The
+  # registry does not forward, so mgmt-a, mgmt-b, and mgmt-c stay isolated.
+  mgmt-a:
+    internal: true
+    ipam: { config: [{ subnet: 10.40.0.0/24 }] }
+  mgmt-b:
+    internal: true
+    ipam: { config: [{ subnet: 10.50.0.0/24 }] }
+  mgmt-c:
+    internal: true
+    ipam: { config: [{ subnet: 10.60.0.0/24 }] }
 
 volumes:
   spire-server-data: {}
   # Holds the Workload API socket and the bootstrap trust bundle. Every node
   # that mounts it sees the same directory across the internal networks.
   spire-agent-socket: {}
+  # Holds the rendered CoreDNS zone files. The registry writes it. The CoreDNS
+  # containers (phase-2 part B) mount it read-only.
+  registry-views: {}

@@ -36,7 +36,15 @@ LABEL_KEY="spiffe.lab/workload"
 
 CLIENT_ID="spiffe://${TRUST_DOMAIN}/zone-a/client"
 BACKEND_B_ID="spiffe://${TRUST_DOMAIN}/zone-b/backend"
+BACKEND_C_ID="spiffe://${TRUST_DOMAIN}/zone-c/backend"
 PEER_ID="spiffe://${TRUST_DOMAIN}/zone-a/peer"
+
+# Phase-2 registry constants. The registry log is inside the registry container.
+# The lease and reap times are short, so the lease tests run in about a minute.
+REGISTRY_LOG="/var/log/lab/registry.log"
+REGISTRAR_LOG="/var/log/lab/registrar.log"
+LEASE_TTL=30
+REAP_INTERVAL=5
 
 GATEWAY_URL="https://zone-b-gateway:9000/"
 GATEWAY_LOG="/var/log/envoy/gateway-access.log"
@@ -45,7 +53,9 @@ C_GATEWAY_B_IP="10.20.0.41"     # zone-c gateway front door, on zone-b
 PEER_PLAIN_URL="http://zone-a-peer:8080/"
 BACKEND_SAN_STAT="listener.0.0.0.0_9001.ssl.fail_verify_san"
 
-TOTAL=11
+# Phase 1 asserts P1 to P11. Phase-2 part A adds P15 to P18. P12 to P14 and P19
+# land in part B (CoreDNS), so this file does not assert them yet.
+TOTAL=15
 HOLD=0
 declare -A RESULT
 
@@ -394,6 +404,180 @@ assert_p11() {
   fi
 }
 
+# ============================ phase-2 registry helpers ======================
+
+# registry_post sends one register request from a container, with that
+# container's own SVID. The test never reads the curl output for the decision.
+# It reads the registry log, which is positive server-side evidence.
+registry_post() {
+  local from="$1" zone="$2" svc="$3"
+  dc exec -T "${from}" bash -c '
+    rm -rf /tmp/reg && mkdir -p /tmp/reg
+    spire-agent api fetch x509 -socketPath /run/spire/agent.sock -write /tmp/reg >/dev/null 2>&1
+    curl -sS --cert /tmp/reg/svid.0.pem --key /tmp/reg/svid.0.key --cacert /tmp/reg/bundle.0.pem \
+      -X POST https://zone-registry:9443/register -H "Content-Type: application/json" \
+      -d "{\"zone\":\"'"${zone}"'\",\"service\":\"'"${svc}"'\",\"ip\":\"10.20.0.50\",\"port\":9001}" \
+      --max-time 8 >/dev/null 2>&1 || true
+  ' >/dev/null 2>&1 || true
+}
+
+# registry_get reads /registry through the registry Envoy, with a valid SVID.
+# The reader is zone-c-backend, which the lease tests never revoke.
+registry_get() {
+  dc exec -T zone-c-backend bash -c '
+    rm -rf /tmp/rget && mkdir -p /tmp/rget
+    spire-agent api fetch x509 -socketPath /run/spire/agent.sock -write /tmp/rget >/dev/null 2>&1
+    curl -sS --cert /tmp/rget/svid.0.pem --key /tmp/rget/svid.0.key --cacert /tmp/rget/bundle.0.pem \
+      https://zone-registry:9443/registry --max-time 8 2>&1 || true
+  ' 2>&1 || true
+}
+
+# has_record returns 0 when the /registry JSON holds the named record.
+has_record() { grep -q "\"name\":\"$1\"" <<<"$2"; }
+
+# registry_log greps the registry container log for a pattern.
+registry_log() { dc exec -T zone-registry grep -a "$1" "${REGISTRY_LOG}" 2>/dev/null || true; }
+
+# start_b_registrar starts the zone-b-backend registrar. The tests use it to
+# restore the renewal after they stop it.
+start_b_registrar() {
+  dc exec -d zone-b-backend bash -c \
+    "REGISTRY_ADDR=zone-registry REGISTRY_PORT=9443 ZONE=zone-b SERVICE=backend IP=10.20.0.50 PORT=9001 INTERVAL=10 \
+     registrar >>${REGISTRAR_LOG} 2>&1" >/dev/null 2>&1 || true
+}
+
+# wait_record waits until the named record is present (want=yes) or gone
+# (want=no). It returns 0 on success.
+wait_record() {
+  local name="$1" want="$2" secs="$3" i recs
+  for ((i = 1; i <= secs; i++)); do
+    recs="$(registry_get)"
+    if [[ "${want}" == "yes" ]] && has_record "${name}" "${recs}"; then return 0; fi
+    if [[ "${want}" == "no" ]] && ! has_record "${name}" "${recs}"; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# ============================ P15 ===========================================
+assert_p15() {
+  heading "P15 Cross-zone registration refused"
+  # The caller is zone-b/backend. It tries to register into zone-c. The zone
+  # differs, so the registry must refuse it with the exact reason. To prove the
+  # rule can fail, delete the zone check in registry/main.go authorize(): the
+  # same call would then be ACCEPTED.
+  registry_post zone-b-backend zone-c backend
+  local line
+  line="$(registry_log "REFUSED caller=${BACKEND_B_ID} wants=backend.zone-c" | grep -a "cross-zone registration refused" | tail -n1)"
+  log "  registry log: ${line:-<none>}"
+  if [[ -n "${line}" ]]; then
+    record P15 PASS "zone-b/backend was refused into zone-c with 'cross-zone registration refused'"
+  else
+    record P15 FAIL "no registry log line refused the cross-zone registration with the exact reason"
+  fi
+}
+
+# ============================ P16 ===========================================
+assert_p16() {
+  heading "P16 Wrong-service registration refused"
+  # The caller is zone-b/backend. It tries to register the service "payments"
+  # in its own zone. The service differs, so the registry must refuse it with
+  # 'service mismatch'.
+  registry_post zone-b-backend zone-b payments
+  local line
+  line="$(registry_log "REFUSED caller=${BACKEND_B_ID} wants=payments.zone-b" | grep -a "service mismatch" | tail -n1)"
+  log "  registry log: ${line:-<none>}"
+  if [[ -n "${line}" ]]; then
+    record P16 PASS "zone-b/backend was refused service 'payments' with 'service mismatch'"
+  else
+    record P16 FAIL "no registry log line refused the wrong service with 'service mismatch'"
+  fi
+}
+
+# ============================ P17 ===========================================
+assert_p17() {
+  heading "P17 Lease expiry reaps the record"
+  # Premise: both backend records renew now. backend.zone-c is the CONTROL. It
+  # keeps renewing, so its survival attributes the reap to the stopped renewal.
+  if ! wait_record "backend.zone-b" yes 30 || ! wait_record "backend.zone-c" yes 30; then
+    record P17 INCONCLUSIVE "the two backend records were not both present at the start"
+    return
+  fi
+  log "  premise: backend.zone-b and backend.zone-c are both registered"
+
+  # Stop only the zone-b registrar. backend.zone-b must now age out.
+  dc exec -T zone-b-backend pkill -f /usr/local/bin/registrar >/dev/null 2>&1 || true
+  log "  stopped the zone-b-backend registrar; waiting for the lease to expire"
+
+  local window=$((LEASE_TTL + REAP_INTERVAL + 25))
+  local reaped="no" control="no"
+  if wait_record "backend.zone-b" no "${window}"; then reaped="yes"; fi
+  local recs; recs="$(registry_get)"
+  has_record "backend.zone-c" "${recs}" && control="yes"
+  local expired_line; expired_line="$(registry_log "EXPIRED backend.zone-b" | tail -n1)"
+  log "  registry log: ${expired_line:-<none>}"
+  log "  after the window: backend.zone-b reaped=${reaped}, backend.zone-c (control) present=${control}"
+
+  # Restore the zone-b registrar, always.
+  start_b_registrar
+  if ! wait_record "backend.zone-b" yes 30; then
+    log "  WARNING: backend.zone-b did not re-register after restore"
+  fi
+
+  if [[ "${reaped}" == "yes" && "${control}" == "yes" && -n "${expired_line}" ]]; then
+    record P17 PASS "the un-renewed backend.zone-b was reaped; the renewing control survived"
+  elif [[ "${reaped}" == "yes" && "${control}" != "yes" ]]; then
+    record P17 INCONCLUSIVE "backend.zone-b left, but the control also left; the reap is not attributable"
+  else
+    record P17 FAIL "backend.zone-b was not reaped within the lease window"
+  fi
+}
+
+# ============================ P18 ===========================================
+assert_p18() {
+  heading "P18 Revoked identity ages out"
+  # Premise: backend.zone-b renews now. Its registrar keeps running through the
+  # whole test. Only the identity is revoked.
+  if ! wait_record "backend.zone-b" yes 40; then
+    record P18 INCONCLUSIVE "backend.zone-b was not registered at the start"
+    return
+  fi
+  local sel eid
+  sel="docker:label:${LABEL_KEY}:zone-b-backend"
+  eid="$(spire_server entry show -spiffeID "${BACKEND_B_ID}" 2>/dev/null | awk '/^Entry ID/{print $4; exit}')"
+  if [[ -z "${eid}" ]]; then
+    record P18 INCONCLUSIVE "no zone-b-backend entry to revoke"
+    return
+  fi
+
+  # Delete the entry. The registrar re-fetches the SVID before each renewal, so
+  # it soon holds no certificate and its renewal fails. The record then ages out.
+  spire_server entry delete -entryID "${eid}" >/dev/null 2>&1
+  log "  deleted the zone-b-backend entry ${eid}; the registrar can no longer renew"
+
+  local window=$((LEASE_TTL + REAP_INTERVAL + 60))
+  local aged="no"
+  if wait_record "backend.zone-b" no "${window}"; then aged="yes"; fi
+  local fail_line; fail_line="$(dc exec -T zone-b-backend grep -a 'RENEWAL SKIPPED\|RENEWAL FAILED' "${REGISTRAR_LOG}" 2>/dev/null | tail -n1)"
+  local expired_line; expired_line="$(registry_log "EXPIRED backend.zone-b" | tail -n1)"
+  log "  registrar log: ${fail_line:-<none>}"
+  log "  registry log:  ${expired_line:-<none>}"
+  log "  after the window: backend.zone-b aged out=${aged}"
+
+  # Restore the entry, always. The registrar then re-fetches and re-registers.
+  spire_server entry create -parentID "${PARENT_ID}" -spiffeID "${BACKEND_B_ID}" -selector "${sel}" >/dev/null 2>&1 \
+    || log "  COULD NOT RESTORE the zone-b-backend entry; remediation: re-run scripts/register.sh"
+  wait_record "backend.zone-b" yes 40 >/dev/null 2>&1 || log "  WARNING: backend.zone-b did not re-register after restore"
+
+  if [[ "${aged}" == "yes" && -n "${fail_line}" && -n "${expired_line}" ]]; then
+    record P18 PASS "after revocation the registrar could not renew; the record aged out"
+  elif [[ "${aged}" == "yes" ]]; then
+    record P18 INCONCLUSIVE "the record left, but no renewal-failure line attributed it to revocation"
+  else
+    record P18 FAIL "the record did not age out after the identity was revoked"
+  fi
+}
+
 # ============================ teardown safety ===============================
 teardown() {
   # Best-effort restore of any shared state a failed property may have left.
@@ -402,6 +586,17 @@ teardown() {
   net="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{println $k}}{{end}}' \
     "$(dc ps -q zone-b-backend 2>/dev/null)" 2>/dev/null | grep 'zone-b$' | head -n1 || true)"
   [[ -n "${peer_cid}" && -n "${net}" ]] && docker network disconnect "${net}" "${peer_cid}" 2>/dev/null || true
+
+  # Best-effort restore of the zone-b-backend entry and registrar. The lease
+  # tests stop them. A full teardown destroys the lab anyway, so this matters
+  # only for SKIP_CYCLE=1 development runs.
+  if [[ "${SKIP_CYCLE}" == "1" ]]; then
+    if ! spire_server entry show -spiffeID "${BACKEND_B_ID}" 2>/dev/null | grep -q '^Entry ID'; then
+      spire_server entry create -parentID "${PARENT_ID}" -spiffeID "${BACKEND_B_ID}" \
+        -selector "docker:label:${LABEL_KEY}:zone-b-backend" >/dev/null 2>&1 || true
+    fi
+    start_b_registrar
+  fi
 
   if [[ "${SKIP_CYCLE}" != "1" ]]; then
     log ""
@@ -431,6 +626,12 @@ main() {
   assert_p10
   assert_p11
 
+  # Phase-2 part A: the registration and lease properties.
+  assert_p15
+  assert_p16
+  assert_p17
+  assert_p18
+
   heading "SAN-pin negative test (mandatory, spec section 15)"
   local san_out san_status=0
   san_out="$(COMPOSE="${COMPOSE}" ./scripts/test-san-pin.sh 2>&1)" || san_status=$?
@@ -441,7 +642,8 @@ main() {
   # ---------------- report ----------------
   heading "Report"
   local id
-  for id in P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 P11; do
+  log "  phase 1 (P1-P11) and phase-2 part A (P15-P18); P12-P14 and P19 land in part B"
+  for id in P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 P11 P15 P16 P17 P18; do
     printf '  %-4s %s\n' "${id}" "${RESULT[${id}]:-MISSING}"
   done
   log ""
