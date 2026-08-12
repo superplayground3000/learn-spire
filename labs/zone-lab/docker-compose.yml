@@ -1,0 +1,197 @@
+name: zone-lab
+
+# Zone-lab, phase 1. The lab moves the enforcement point out of the app code
+# and into Envoy. Ten containers form three security zones plus one control
+# plane. One SPIRE agent uses docker:label attestation. The agent serves the
+# Workload API on a socket in a shared volume. That socket crosses the internal
+# zone networks, so a workload gets its identity without a route to the server.
+#
+# Trap 4: a workload needs no control network. Only the server and the agent
+# sit on control. The shared socket volume carries the Workload API.
+
+# Every zone node starts from one image. Only the label, the network, and the
+# started process differ.
+x-node: &node
+  image: zone-lab:1.15.2
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  # Read-only: a node connects to the socket, but it must not delete or replace
+  # it for the other nodes.
+  volumes:
+    - spire-agent-socket:/run/spire:ro
+  depends_on:
+    - spire-agent
+
+services:
+  # --- Control plane, on the "control" network only -------------------------
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:1.15.2
+    container_name: zone-lab-spire-server
+    hostname: spire-server
+    command: ["-config", "/etc/spire/server/server.conf"]
+    volumes:
+      - ./infra/spire/server.conf:/etc/spire/server/server.conf:ro
+      - spire-server-data:/var/lib/spire/server
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    networks:
+      control: {}
+
+  # The agent runs alone. The docker attestor reads the other containers'
+  # labels through the Docker socket, so it needs pid:host and docker.sock.
+  spire-agent:
+    <<: *node
+    container_name: zone-lab-spire-agent
+    hostname: spire-agent
+    depends_on:
+      spire-server:
+        condition: service_healthy
+    init: true
+    # The attestor reads /proc/<pid>/ of the calling process. It needs the host
+    # PID namespace to see a workload PID at all.
+    pid: "host"
+    volumes:
+      - ./infra/spire/agent.conf:/opt/spire/conf/agent/agent.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The agent OWNS the socket volume; it mounts it read-write.
+      - spire-agent-socket:/run/spire
+    networks:
+      control: {}
+
+  # --- Zone B gateway: dual-homed on zone-a and zone-b ----------------------
+  # It admits only zone-a/client at Layer 7, then re-originates mTLS to the
+  # zone-b backend and pins the backend SPIFFE ID.
+  zone-b-gateway:
+    <<: *node
+    container_name: zone-lab-zone-b-gateway
+    hostname: zone-b-gateway
+    labels:
+      spiffe.lab/workload: "zone-b-gateway"
+    volumes:
+      - spire-agent-socket:/run/spire:ro
+      - ./conf/zone-b-gateway-envoy.yaml:/etc/envoy/zone-b-gateway-envoy.yaml:ro
+    networks:
+      zone-a: { ipv4_address: 10.10.0.40 }
+      zone-b: { ipv4_address: 10.20.0.40 }
+
+  # --- Zone B backend: on zone-b only ---------------------------------------
+  # Envoy fronts the Go backend app on 127.0.0.1:8080. It admits only the
+  # zone-b gateway identity, by a SAN pin and a network RBAC filter.
+  zone-b-backend:
+    <<: *node
+    container_name: zone-lab-zone-b-backend
+    hostname: zone-b-backend
+    labels:
+      spiffe.lab/workload: "zone-b-backend"
+    environment:
+      ZONE: "zone-b"
+    volumes:
+      - spire-agent-socket:/run/spire:ro
+      - ./conf/zone-b-backend-envoy.yaml:/etc/envoy/zone-b-backend-envoy.yaml:ro
+    networks:
+      zone-b: { ipv4_address: 10.20.0.50 }
+
+  # --- Zone C gateway: dual-homed on zone-b and zone-c ----------------------
+  # It admits only zone-b/backend at Layer 7. Zone A cannot reach it at all.
+  zone-c-gateway:
+    <<: *node
+    container_name: zone-lab-zone-c-gateway
+    hostname: zone-c-gateway
+    labels:
+      spiffe.lab/workload: "zone-c-gateway"
+    volumes:
+      - spire-agent-socket:/run/spire:ro
+      - ./conf/zone-c-gateway-envoy.yaml:/etc/envoy/zone-c-gateway-envoy.yaml:ro
+    networks:
+      zone-b: { ipv4_address: 10.20.0.41 }
+      zone-c: { ipv4_address: 10.30.0.40 }
+
+  # --- Zone C backend: on zone-c only ---------------------------------------
+  zone-c-backend:
+    <<: *node
+    container_name: zone-lab-zone-c-backend
+    hostname: zone-c-backend
+    labels:
+      spiffe.lab/workload: "zone-c-backend"
+    environment:
+      ZONE: "zone-c"
+    volumes:
+      - spire-agent-socket:/run/spire:ro
+      - ./conf/zone-c-backend-envoy.yaml:/etc/envoy/zone-c-backend-envoy.yaml:ro
+    networks:
+      zone-c: { ipv4_address: 10.30.0.50 }
+
+  # --- Zone A peer: the intra-zone plaintext target -------------------------
+  # The client calls the peer over plain HTTP, with no mTLS and no gateway.
+  # This proves mTLS happens only at the zone boundary (property P10).
+  zone-a-peer:
+    <<: *node
+    container_name: zone-lab-zone-a-peer
+    hostname: zone-a-peer
+    labels:
+      spiffe.lab/workload: "zone-a-peer"
+    networks:
+      zone-a: { ipv4_address: 10.10.0.30 }
+
+  # --- One-shot workloads, in the "demo" profile ----------------------------
+  # These run with "docker compose run --rm". Compose applies the service label,
+  # so the agent attests the run container by its container label.
+  zone-a-client:
+    <<: *node
+    container_name: zone-lab-zone-a-client
+    hostname: zone-a-client
+    profiles: ["demo"]
+    labels:
+      spiffe.lab/workload: "zone-a-client"
+    networks:
+      zone-a: { ipv4_address: 10.10.0.20 }
+
+  zone-a-intruder:
+    <<: *node
+    container_name: zone-lab-zone-a-intruder
+    hostname: zone-a-intruder
+    profiles: ["demo"]
+    labels:
+      spiffe.lab/workload: "zone-a-intruder"
+    networks:
+      zone-a: { ipv4_address: 10.10.0.21 }
+
+  # zone-a-unregistered gets NO entry, on purpose. It proves that a container
+  # with no registration entry gets no SVID (property P11).
+  zone-a-unregistered:
+    <<: *node
+    container_name: zone-lab-zone-a-unregistered
+    hostname: zone-a-unregistered
+    profiles: ["demo"]
+    labels:
+      spiffe.lab/workload: "zone-a-unregistered"
+    networks:
+      zone-a: { ipv4_address: 10.10.0.22 }
+
+networks:
+  # The control network is a normal bridge. The server and the agent use it.
+  control:
+    driver: bridge
+  # internal: true removes the off-network default route. A blocked cross-zone
+  # probe then returns "Network is unreachable", not "Connection refused". This
+  # difference is load-bearing for property P1.
+  zone-a:
+    internal: true
+    ipam: { config: [{ subnet: 10.10.0.0/24 }] }
+  zone-b:
+    internal: true
+    ipam: { config: [{ subnet: 10.20.0.0/24 }] }
+  zone-c:
+    internal: true
+    ipam: { config: [{ subnet: 10.30.0.0/24 }] }
+
+volumes:
+  spire-server-data: {}
+  # Holds the Workload API socket and the bootstrap trust bundle. Every node
+  # that mounts it sees the same directory across the internal networks.
+  spire-agent-socket: {}
