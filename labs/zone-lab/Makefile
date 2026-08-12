@@ -28,7 +28,10 @@ COMPOSE_ALL := $(COMPOSE) --profile demo --profile dns
 
 .PHONY: help build lab-up demo demo-intruder demo-unregistered demo-bearer \
         demo-latency demo-rotation demo-register demo-dns inspect \
-        test-integration test-san-pin lab-down
+        test-integration test-san-pin ui test-ui lab-down
+
+# The control panel binds 127.0.0.1:8900 by default. UI_PORT overrides the port.
+UI_PORT ?= 8900
 
 help:
 	@echo 'make build             - build the zone-lab image (SPIRE agent, Envoy, the two Go apps)'
@@ -43,6 +46,8 @@ help:
 	@echo 'make demo-register     - phase 2: a registration walk-through (accept, list, two refusals)'
 	@echo 'make demo-dns          - phase 2: a DNS resolution walk-through (self, peer, NXDOMAIN, bypass)'
 	@echo 'make inspect           - show agents, entries, SVIDs, and Envoy secrets'
+	@echo 'make ui                - phase 3: start the host-side control panel (127.0.0.1:8900)'
+	@echo 'make test-ui           - phase 3: UI smoke test (panel starts, /api/state is valid JSON)'
 	@echo 'make lab-down          - stop the lab and delete all runtime state'
 
 build:
@@ -85,6 +90,17 @@ demo-dns:
 
 inspect:
 	COMPOSE="$(COMPOSE)" ./scripts/inspect.sh
+
+# ui starts the host-side operator console. It runs on the host with Python 3
+# stdlib only, binds 127.0.0.1:8900, and shells out to docker. It is a demo and
+# operator tool, not a security control. Bring the lab up first.
+ui:
+	COMPOSE="$(COMPOSE)" python3 ui/server.py --port $(UI_PORT)
+
+# test-ui runs the UI smoke test against an already-running lab. It never flips
+# a policy cell, and it adds no property to the nineteen-property green bar.
+test-ui:
+	COMPOSE="$(COMPOSE)" UI_PORT=$(UI_PORT) ./scripts/test-ui.sh
 
 # test-integration deletes all lab state, builds a fresh lab, asserts every
 # property and the SAN-pin test, and leaves the lab down (a trap on EXIT).
