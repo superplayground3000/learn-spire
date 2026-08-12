@@ -26,7 +26,8 @@ COMPOSE_ALL := $(COMPOSE) --profile demo
 .DEFAULT_GOAL := help
 
 .PHONY: help build lab-up demo demo-intruder demo-unregistered demo-bearer \
-        demo-latency demo-rotation inspect test-integration test-san-pin lab-down
+        demo-latency demo-rotation demo-register inspect test-integration \
+        test-san-pin lab-down
 
 help:
 	@echo 'make build             - build the zone-lab image (SPIRE agent, Envoy, the two Go apps)'
@@ -38,6 +39,7 @@ help:
 	@echo 'make demo-bearer       - the bearer-credential FINDING (a stolen SVID still works)'
 	@echo 'make demo-latency      - the gateway-hop overhead number (teaching, not the green bar)'
 	@echo 'make demo-rotation     - the SDS rotation demo (outside the green bar)'
+	@echo 'make demo-register     - phase 2: a registration walk-through (accept, list, two refusals)'
 	@echo 'make inspect           - show agents, entries, SVIDs, and Envoy secrets'
 	@echo 'make lab-down          - stop the lab and delete all runtime state'
 
@@ -72,6 +74,9 @@ demo-latency:
 
 demo-rotation:
 	COMPOSE="$(COMPOSE)" ./scripts/demo-rotation.sh
+
+demo-register:
+	COMPOSE="$(COMPOSE)" ./scripts/demo-register.sh
 
 inspect:
 	COMPOSE="$(COMPOSE)" ./scripts/inspect.sh

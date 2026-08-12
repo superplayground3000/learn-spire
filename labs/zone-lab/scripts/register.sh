@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Creates the seven workload registration entries. An entry maps a container
+# Creates the eight workload registration entries. An entry maps a container
 # label to a SPIFFE ID:
 #
 #   zone-a-client   -> spiffe://lab.local/zone-a/client
@@ -10,6 +10,7 @@
 #   zone-b-backend  -> spiffe://lab.local/zone-b/backend
 #   zone-c-gateway  -> spiffe://lab.local/zone-c/gateway   (+ DNS SAN)
 #   zone-c-backend  -> spiffe://lab.local/zone-c/backend
+#   zone-registry   -> spiffe://lab.local/mgmt/registry    (+ DNS SAN)
 #
 # Trap 3: the label is flat, but the SPIFFE path is nested. The map is explicit;
 # the script never assumes the SPIFFE path equals the label value.
@@ -29,7 +30,7 @@ LABEL_KEY="spiffe.lab/workload"
 PARENT_ID="spiffe://${TRUST_DOMAIN}/node"
 
 # The barrier waits until the server reports this many entries.
-EXPECTED_ENTRIES=7
+EXPECTED_ENTRIES=8
 SYNC_ATTEMPTS="${SYNC_ATTEMPTS:-30}"
 
 log() { printf '%s\n' "$*"; }
@@ -46,6 +47,7 @@ ENTRIES=(
   "zone-b-backend|zone-b/backend|"
   "zone-c-gateway|zone-c/gateway|zone-c-gateway"
   "zone-c-backend|zone-c/backend|"
+  "zone-registry|mgmt/registry|zone-registry"
 )
 
 entry_exists() {
