@@ -203,6 +203,54 @@ services:
     networks:
       zone-a: { ipv4_address: 10.10.0.22 }
 
+  # --- CoreDNS: one resolver per zone (phase-2 part B) ----------------------
+  # Each resolver sits on its own zone network at a fixed address (.53). It
+  # mounts the shared registry-views volume READ-ONLY and serves ONLY its own
+  # zone's view file with the file plugin. The SOA in the view makes an absent
+  # name return NXDOMAIN, not SERVFAIL. reload 5s lands a new view with no
+  # restart. DNS is steering only; the phase-1 network and identity layers
+  # enforce (property P19 proves this).
+  #
+  # These resolvers sit in the "dns" profile, so plain "up -d" does not start
+  # them. lab-up starts them last, after the registry has rendered the views. A
+  # file plugin with a missing file fails to load, so the views must exist first.
+  # They are still always-up: long-lived services, not one-shot demo workloads.
+  coredns-a:
+    image: coredns/coredns:1.11.3
+    container_name: zone-lab-coredns-a
+    hostname: coredns-a
+    profiles: ["dns"]
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./conf/coredns/Corefile.zone-a:/etc/coredns/Corefile:ro
+      - registry-views:/etc/coredns/views:ro
+    networks:
+      zone-a: { ipv4_address: 10.10.0.53 }
+
+  coredns-b:
+    image: coredns/coredns:1.11.3
+    container_name: zone-lab-coredns-b
+    hostname: coredns-b
+    profiles: ["dns"]
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./conf/coredns/Corefile.zone-b:/etc/coredns/Corefile:ro
+      - registry-views:/etc/coredns/views:ro
+    networks:
+      zone-b: { ipv4_address: 10.20.0.53 }
+
+  coredns-c:
+    image: coredns/coredns:1.11.3
+    container_name: zone-lab-coredns-c
+    hostname: coredns-c
+    profiles: ["dns"]
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./conf/coredns/Corefile.zone-c:/etc/coredns/Corefile:ro
+      - registry-views:/etc/coredns/views:ro
+    networks:
+      zone-c: { ipv4_address: 10.30.0.53 }
+
 networks:
   # The control network is a normal bridge. The server and the agent use it.
   control:

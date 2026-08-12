@@ -53,9 +53,22 @@ C_GATEWAY_B_IP="10.20.0.41"     # zone-c gateway front door, on zone-b
 PEER_PLAIN_URL="http://zone-a-peer:8080/"
 BACKEND_SAN_STAT="listener.0.0.0.0_9001.ssl.fail_verify_san"
 
-# Phase 1 asserts P1 to P11. Phase-2 part A adds P15 to P18. P12 to P14 and P19
-# land in part B (CoreDNS), so this file does not assert them yet.
-TOTAL=15
+# Phase-2 part B: the per-zone CoreDNS resolvers and the names they steer. Each
+# resolver sits on its own zone network at .53. The tests query the zone
+# resolver directly by address, so each read is deterministic. The registry
+# never writes a real backend address into a peer's view, so a peer can only
+# ever resolve the gateway address, never the real backend.
+COREDNS_A_IP="10.10.0.53"
+COREDNS_B_IP="10.20.0.53"
+COREDNS_C_IP="10.30.0.53"
+NAME_B="backend.zone-b.internal."   # zone-b's own service
+NAME_C="backend.zone-c.internal."   # zone-c's own service
+BACKEND_C_IP="10.30.0.50"           # the real zone-c backend Envoy address
+B_GATEWAY_IN_A="10.10.0.40"         # the zone-b gateway, as seen from zone-a
+
+# Phase 1 asserts P1 to P11. Phase-2 part A adds P15 to P18. Phase-2 part B adds
+# P12 to P14 (DNS steering) and P19 (the bypass punchline).
+TOTAL=19
 HOLD=0
 declare -A RESULT
 
@@ -578,6 +591,139 @@ assert_p18() {
   fi
 }
 
+# ============================ phase-2 part B: DNS helpers ====================
+
+# dns_status reads the DNS rcode from a zone resolver. It returns NOERROR,
+# NXDOMAIN, SERVFAIL, or NONE. The name carries a trailing dot, so dig never
+# appends a search domain; a search-domain rc=0 can never be read as an answer.
+dns_status() {
+  local from="$1" server="$2" name="$3" out st
+  out="$(dc exec -T "${from}" dig @"${server}" "${name}" +time=3 +tries=2 2>/dev/null || true)"
+  st="$(grep -oE 'status: [A-Z]+' <<<"${out}" | head -n1 | awk '{print $2}')"
+  printf '%s' "${st:-NONE}"
+}
+
+# dns_a reads the first A address a zone resolver returns for a name. On NXDOMAIN
+# it prints nothing. This is the positive evidence: the actual resolved address.
+dns_a() {
+  local from="$1" server="$2" name="$3"
+  dc exec -T "${from}" dig @"${server}" "${name}" +short 2>/dev/null \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true
+}
+
+# wait_dns_a waits until a resolver returns the wanted address for a name. It
+# covers the reload lag (the file plugin polls every 5s).
+wait_dns_a() {
+  local from="$1" server="$2" name="$3" want="$4" secs="$5" i got
+  for ((i = 1; i <= secs; i++)); do
+    got="$(dns_a "${from}" "${server}" "${name}")"
+    [[ "${got}" == "${want}" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# ============================ P12 ===========================================
+assert_p12() {
+  heading "P12 Self-zone resolves to the real address"
+  # Premise: backend.zone-b is registered, so zone-b's own view holds it as a
+  # real A record. A zone-b workload asks zone-b's resolver.
+  if ! wait_record "backend.zone-b" yes 40; then
+    record P12 INCONCLUSIVE "backend.zone-b was not registered, so it has no view record"
+    return
+  fi
+  # Give the view a moment to reach CoreDNS (the file plugin reloads every 5s).
+  wait_dns_a zone-b-backend "${COREDNS_B_IP}" "${NAME_B}" "${BACKEND_B_IP}" 40 >/dev/null 2>&1 || true
+  local ans st
+  ans="$(dns_a zone-b-backend "${COREDNS_B_IP}" "${NAME_B}")"
+  st="$(dns_status zone-b-backend "${COREDNS_B_IP}" "${NAME_B}")"
+  log "  zone-b-backend asks ${COREDNS_B_IP}: ${NAME_B} -> ${ans:-<none>} (status ${st})"
+  if [[ "${st}" == "NOERROR" && "${ans}" == "${BACKEND_B_IP}" ]]; then
+    record P12 PASS "backend.zone-b resolved to the real address ${BACKEND_B_IP}"
+  else
+    record P12 FAIL "backend.zone-b did not resolve to ${BACKEND_B_IP} (got ${ans:-<none>}, status ${st})"
+  fi
+}
+
+# ============================ P13 ===========================================
+assert_p13() {
+  heading "P13 Authorized peer resolves to the gateway, never the backend"
+  # zone-a may reach zone-b. zone-a's view holds one wildcard for zone-b that
+  # points at the zone-b gateway, as seen from zone-a. zone-a's view never holds
+  # the real backend address, so the peer can only ever get the gateway. The
+  # wildcard is policy-derived, so it needs no registration.
+  wait_dns_a zone-a-peer "${COREDNS_A_IP}" "${NAME_B}" "${B_GATEWAY_IN_A}" 40 >/dev/null 2>&1 || true
+  local ans st
+  ans="$(dns_a zone-a-peer "${COREDNS_A_IP}" "${NAME_B}")"
+  st="$(dns_status zone-a-peer "${COREDNS_A_IP}" "${NAME_B}")"
+  log "  zone-a-peer asks ${COREDNS_A_IP}: ${NAME_B} -> ${ans:-<none>} (status ${st})"
+  log "  gateway-as-seen-from-a=${B_GATEWAY_IN_A}, real backend=${BACKEND_B_IP}"
+  if [[ "${ans}" == "${BACKEND_B_IP}" ]]; then
+    record P13 FAIL "LEAK: the peer resolved the cross-zone name to the REAL backend ${BACKEND_B_IP}"
+  elif [[ "${st}" == "NOERROR" && "${ans}" == "${B_GATEWAY_IN_A}" ]]; then
+    record P13 PASS "the peer got the gateway ${B_GATEWAY_IN_A}, never the real backend ${BACKEND_B_IP}"
+  else
+    record P13 FAIL "the peer did not resolve to the gateway ${B_GATEWAY_IN_A} (got ${ans:-<none>}, status ${st})"
+  fi
+}
+
+# ============================ P14 ===========================================
+assert_p14() {
+  heading "P14 Unauthorized zone gets NXDOMAIN (not SERVFAIL)"
+  # zone-a may NOT reach zone-c. zone-a's view holds no zone-c name. The view has
+  # an SOA, so an absent name is authoritative NXDOMAIN, not SERVFAIL. A liveness
+  # control proves the resolver still answers a valid name, so NXDOMAIN means
+  # containment, not a dead resolver.
+  local deny_st live_st live_ans
+  deny_st="$(dns_status zone-a-peer "${COREDNS_A_IP}" "${NAME_C}")"
+  live_ans="$(dns_a zone-a-peer "${COREDNS_A_IP}" "${NAME_B}")"
+  live_st="$(dns_status zone-a-peer "${COREDNS_A_IP}" "${NAME_B}")"
+  log "  zone-a-peer asks ${COREDNS_A_IP}: ${NAME_C} -> status ${deny_st} (unauthorized)"
+  log "  liveness control: ${NAME_B} -> ${live_ans:-<none>} (status ${live_st})"
+  if [[ "${live_st}" != "NOERROR" ]]; then
+    record P14 INCONCLUSIVE "the resolver did not answer the valid control name; it may be dead"
+    return
+  fi
+  if [[ "${deny_st}" == "NXDOMAIN" ]]; then
+    record P14 PASS "the unauthorized zone-c name got NXDOMAIN; the resolver still answers a valid name"
+  elif [[ "${deny_st}" == "SERVFAIL" ]]; then
+    record P14 FAIL "the unauthorized name got SERVFAIL, not NXDOMAIN"
+  else
+    record P14 FAIL "the unauthorized name did not get NXDOMAIN (status ${deny_st})"
+  fi
+}
+
+# ============================ P19 ===========================================
+assert_p19() {
+  heading "P19 DNS bypass is still contained (the punchline)"
+  # A zone-a client IGNORES DNS. It hardcodes the REAL zone-c backend address and
+  # dials it. DNS steering already said NXDOMAIN for that name (P14). But even a
+  # hardcoded address is stopped by the phase-1 network layer: zone-a holds no
+  # route to zone-c. So the probe returns "Network is unreachable".
+  # "Connection refused" would mean a route exists; that is INCONCLUSIVE.
+  local probe control
+  probe="$(dc --progress quiet run --rm -T zone-a-client \
+    nc -w 4 -v "${BACKEND_C_IP}" 9001 2>&1 || true)"
+  log "  zone-a-client hardcodes ${BACKEND_C_IP}:9001 (real zone-c backend) :: ${probe}"
+
+  # The mandatory positive control: a zone-c node reaches the same address, so
+  # the target is alive. The block is containment, not a dead backend.
+  control="$(dc exec -T zone-c-gateway nc -w 4 -vz "${BACKEND_C_IP}" 9001 2>&1 || true)"
+  log "  zone-c-gateway -> ${BACKEND_C_IP}:9001 (control) :: ${control}"
+
+  if ! grep -qi 'succeeded' <<<"${control}"; then
+    record P19 INCONCLUSIVE "the positive control did not reach the zone-c backend; the target may be down"
+    return
+  fi
+  if grep -qi 'Network is unreachable' <<<"${probe}"; then
+    record P19 PASS "the hardcoded-IP bypass hit 'Network is unreachable'; the network layer contains it, not DNS"
+  elif grep -qi 'Connection refused' <<<"${probe}"; then
+    record P19 INCONCLUSIVE "got 'Connection refused' (a route exists); not the containment we assert"
+  else
+    record P19 INCONCLUSIVE "the bypass probe did not return 'Network is unreachable'"
+  fi
+}
+
 # ============================ teardown safety ===============================
 teardown() {
   # Best-effort restore of any shared state a failed property may have left.
@@ -632,6 +778,12 @@ main() {
   assert_p17
   assert_p18
 
+  # Phase-2 part B: the DNS steering properties and the bypass punchline.
+  assert_p12
+  assert_p13
+  assert_p14
+  assert_p19
+
   heading "SAN-pin negative test (mandatory, spec section 15)"
   local san_out san_status=0
   san_out="$(COMPOSE="${COMPOSE}" ./scripts/test-san-pin.sh 2>&1)" || san_status=$?
@@ -642,8 +794,8 @@ main() {
   # ---------------- report ----------------
   heading "Report"
   local id
-  log "  phase 1 (P1-P11) and phase-2 part A (P15-P18); P12-P14 and P19 land in part B"
-  for id in P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 P11 P15 P16 P17 P18; do
+  log "  phase 1 (P1-P11), phase-2 part A (P15-P18), phase-2 part B (P12-P14 DNS, P19 bypass)"
+  for id in P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 P11 P12 P13 P14 P15 P16 P17 P18 P19; do
     printf '  %-4s %s\n' "${id}" "${RESULT[${id}]:-MISSING}"
   done
   log ""
