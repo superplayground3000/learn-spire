@@ -1,0 +1,10 @@
+# Scratch space for material exported from the running lab (SVIDs, bundles).
+# Nothing produced at runtime belongs in the repository.
+tmp/*
+!tmp/.gitkeep
+
+# The control panel runtime state. The saved policy and any temp Envoy config
+# the panel writes are runtime state, never source.
+ui/.policy.json
+ui/gw-envoy-*.yaml
+ui/__pycache__/

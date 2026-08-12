@@ -1,0 +1,26 @@
+# CoreDNS for zone-a. This resolver serves ONLY zone-a's view.
+#
+# The registry writes /views/zone-a.zone to the shared registry-views volume.
+# This container mounts that volume read-only at /etc/coredns/views. So the
+# resolver can never change what it serves; it only reads.
+#
+# The view holds zone-a's own services as real A records, and one wildcard per
+# authorized peer zone that points at that peer's gateway. An unauthorized name
+# is absent. The file plugin has an SOA, so an absent name returns NXDOMAIN, not
+# SERVFAIL. DNS is steering here, not a security control.
+internal:53 {
+    errors
+    log
+    # reload 5s: the file plugin polls for a higher SOA serial. The registry
+    # bumps the serial only when the record set changes. So a new view reaches
+    # the resolver in a few seconds, with no restart.
+    file /etc/coredns/views/zone-a.zone internal {
+        reload 5s
+    }
+}
+
+# Any name outside "internal" gets no answer. This resolver is authoritative for
+# one zone only. It is not a general-purpose forwarder.
+.:53 {
+    errors
+}

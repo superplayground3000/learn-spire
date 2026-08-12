@@ -1,0 +1,19 @@
+# CoreDNS for zone-b. This resolver serves ONLY zone-b's view.
+#
+# The registry writes /views/zone-b.zone to the shared registry-views volume.
+# This container mounts that volume read-only at /etc/coredns/views.
+#
+# zone-b's view holds backend.zone-b as a real A record, and one wildcard for
+# zone-c (its authorized peer) that points at the zone-c gateway. DNS is steering
+# here, not a security control.
+internal:53 {
+    errors
+    log
+    file /etc/coredns/views/zone-b.zone internal {
+        reload 5s
+    }
+}
+
+.:53 {
+    errors
+}
