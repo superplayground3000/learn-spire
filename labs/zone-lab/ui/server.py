@@ -193,7 +193,7 @@ def container_networks(name):
 def rewrite_rbac(base_text, allow_ids):
     """Rewrite the L7 RBAC principal list of a gateway Envoy config.
 
-    A port of registry/set_rbac.py. It replaces the entries under the first
+    It replaces the entries under the first
     "principals:" key. An empty allow-list renders one sentinel principal,
     spiffe://invalid/none, which denies everyone -- the correct meaning of "no
     zone may call this gateway".
@@ -805,7 +805,7 @@ class H(BaseHTTPRequestHandler):
                 b = INDEX.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Set-Cookie", f"{COOKIE}={TOKEN}; Path=/; SameSite=Strict")
+                self.send_header("Set-Cookie", f"{COOKIE}={TOKEN}; Path=/; SameSite=Strict; HttpOnly")
                 self.send_header("Content-Length", str(len(b)))
                 self.end_headers()
                 self.wfile.write(b)

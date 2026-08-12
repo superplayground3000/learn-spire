@@ -106,9 +106,10 @@ type record struct {
 }
 
 var (
-	registry = map[string]record{}
-	lock     sync.Mutex
-	lastSig  string // re-render only when the record set changes
+	registry   = map[string]record{}
+	lock       sync.Mutex
+	lastSig    string // re-render only when the record set changes
+	lastSerial int64  // the SOA serial must strictly increase
 )
 
 // peerSpiffeID reads the caller identity from the XFCC header. This is the ONLY
@@ -157,19 +158,6 @@ func authorize(spiffeID, wantZone, wantService string) (bool, string) {
 	return true, "identity matches the requested name exactly"
 }
 
-// signature is the identity of the record SET, not the lease clock. Re-rendering
-// on every reap would bump the SOA serial for nothing.
-func signature() string {
-	lock.Lock()
-	defer lock.Unlock()
-	keys := make([]string, 0, len(registry))
-	for _, r := range registry {
-		keys = append(keys, r.Zone+"|"+r.Service+"|"+r.IP)
-	}
-	sort.Strings(keys)
-	return strings.Join(keys, ",")
-}
-
 // renderViews writes one CoreDNS zone file per zone. It derives each file from
 // three inputs:
 //   - registrations: a zone's own services resolve to their real addresses.
@@ -185,24 +173,38 @@ func renderViews() []string {
 		return nil
 	}
 
-	sig := signature()
+	// renderViews runs from concurrent goroutines: each POST /register handler
+	// and the reap timer. So it reads the record set, compares and sets lastSig,
+	// picks the serial, and snapshots the records in ONE critical section. A
+	// split lets two callers both decide "the set changed" and both write the
+	// same wall-clock second as the SOA serial. The CoreDNS file plugin reloads
+	// only on an increased serial, so the second write would be lost.
+	lock.Lock()
+	keys := make([]string, 0, len(registry))
+	recs := make([]record, 0, len(registry))
+	for _, r := range registry {
+		keys = append(keys, r.Zone+"|"+r.Service+"|"+r.IP)
+		recs = append(recs, r)
+	}
+	sort.Strings(keys)
+	sig := strings.Join(keys, ",")
 	firstView := filepath.Join(viewsDir, zones[0]+".zone")
 	if sig == lastSig {
 		if _, err := os.Stat(firstView); err == nil {
+			lock.Unlock()
 			return zones // nothing changed; leave the serial alone
 		}
 	}
 	lastSig = sig
-
-	lock.Lock()
-	recs := make([]record, 0, len(registry))
-	for _, r := range registry {
-		recs = append(recs, r)
+	// The file plugin reloads on an increased SOA serial, so it must strictly
+	// increase, even for two record-set changes inside one second.
+	serial := time.Now().Unix()
+	if serial <= lastSerial {
+		serial = lastSerial + 1
 	}
+	lastSerial = serial
 	lock.Unlock()
 
-	// The file plugin reloads on an increased SOA serial, so it must change.
-	serial := time.Now().Unix()
 	written := []string{}
 	for _, zone := range zones {
 		var b strings.Builder
