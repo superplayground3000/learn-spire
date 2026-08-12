@@ -1,0 +1,126 @@
+name: zone-lab-spike
+
+# THROWAWAY SPIKE for wayfinder ticket #42. It proves one mechanism:
+#   - one SPIRE agent with docker:label attestation,
+#   - the agent Workload API socket on a shared volume that crosses two
+#     internal Docker networks,
+#   - an Envoy gateway that gets its X.509 SVID and the trust bundle over SDS
+#     from that shared socket.
+#
+# The gateway, the backend, and the client sit on internal networks and never
+# reach the SPIRE server over the network. They only touch the shared socket.
+
+# Every zone node starts from one image. Only the label and the network differ.
+x-node: &node
+  image: zone-lab-spike:1.15.2
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  # Read-only: a node connects to the socket, but it must not delete or replace
+  # it for the other nodes.
+  volumes:
+    - spire-agent-socket:/run/spire:ro
+  depends_on:
+    - spire-agent
+
+services:
+  # --- Control plane, on the normal "control" network -----------------------
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:1.15.2
+    container_name: zone-lab-spire-server
+    hostname: spire-server
+    command: ["-config", "/etc/spire/server/server.conf"]
+    volumes:
+      - ./infra/spire/server.conf:/etc/spire/server/server.conf:ro
+      - spire-server-data:/var/lib/spire/server
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    networks:
+      control: {}
+
+  # The agent runs alone. The docker attestor reads the other containers'
+  # labels through the Docker socket, so it needs pid:host and docker.sock.
+  spire-agent:
+    <<: *node
+    container_name: zone-lab-spire-agent
+    hostname: spire-agent
+    depends_on:
+      spire-server:
+        condition: service_healthy
+    init: true
+    # The attestor reads /proc/<pid>/ of the calling process. It needs the host
+    # PID namespace to see a workload PID at all.
+    pid: "host"
+    volumes:
+      - ./infra/spire/agent.conf:/opt/spire/conf/agent/agent.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The agent OWNS the socket volume; it mounts it read-write.
+      - spire-agent-socket:/run/spire
+    networks:
+      control: {}
+
+  # --- Zone B gateway: dual-homed on zone-a and zone-b ----------------------
+  # It terminates mTLS from the client on zone-a, then re-originates mTLS to the
+  # backend on zone-b. It gets its SVID and the bundle over SDS.
+  zone-b-gateway:
+    <<: *node
+    container_name: zone-lab-zone-b-gateway
+    hostname: zone-b-gateway
+    labels:
+      spiffe.lab/workload: "zone-b-gateway"
+    volumes:
+      - spire-agent-socket:/run/spire:ro
+      - ./conf/gateway-envoy.yaml:/etc/envoy/gateway-envoy.yaml:ro
+    networks:
+      zone-a: { ipv4_address: 172.30.10.40 }
+      zone-b: { ipv4_address: 172.30.20.40 }
+
+  # --- Zone B backend: on zone-b only ---------------------------------------
+  # Envoy fronts a trivial HTTP app on 127.0.0.1:8080. It gets its SVID and the
+  # bundle over SDS.
+  zone-b-backend:
+    <<: *node
+    container_name: zone-lab-zone-b-backend
+    hostname: zone-b-backend
+    labels:
+      spiffe.lab/workload: "zone-b-backend"
+    volumes:
+      - spire-agent-socket:/run/spire:ro
+      - ./conf/backend-envoy.yaml:/etc/envoy/backend-envoy.yaml:ro
+    networks:
+      zone-b: { ipv4_address: 172.30.20.50 }
+
+  # --- Zone A client: on zone-a only ----------------------------------------
+  # It fetches its SVID as files from the agent, then calls the gateway with
+  # curl. It has no route to zone-b at all.
+  zone-a-client:
+    <<: *node
+    container_name: zone-lab-zone-a-client
+    hostname: zone-a-client
+    labels:
+      spiffe.lab/workload: "zone-a-client"
+    networks:
+      zone-a: { ipv4_address: 172.30.10.20 }
+
+networks:
+  # The control network is a normal bridge. The server and the agent use it.
+  control:
+    driver: bridge
+  # internal: true removes the off-network default route. Without it, Docker
+  # routes freely between bridges and the isolation claim is empty.
+  zone-a:
+    internal: true
+    ipam: { config: [{ subnet: 172.30.10.0/24 }] }
+  zone-b:
+    internal: true
+    ipam: { config: [{ subnet: 172.30.20.0/24 }] }
+
+volumes:
+  spire-server-data: {}
+  # Holds the Workload API socket and the bootstrap trust bundle. Every node
+  # that mounts it sees the same directory across the two internal networks.
+  spire-agent-socket: {}
