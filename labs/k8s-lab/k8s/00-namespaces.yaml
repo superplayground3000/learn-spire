@@ -1,0 +1,62 @@
+# The two namespaces and the six service accounts of the lab.
+#
+# The namespace "spire" holds the control plane. The namespace "workloads"
+# holds the four workload pods. All four pods use the same image and the same
+# UID. The service account decides the identity, and that is the point of the
+# lab.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spire
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: workloads
+---
+# The SPIRE server. Its RBAC lets it validate projected service account
+# tokens and patch the trust bundle ConfigMap.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server
+  namespace: spire
+---
+# The SPIRE agent. The server allows this one service account to attest, with
+# the service_account_allow_list of the k8s_psat node attestor.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-agent
+  namespace: spire
+---
+# The API server workload. Its entry matches k8s:ns:workloads plus
+# k8s:sa:server.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: server
+  namespace: workloads
+---
+# The authorized client. Its entry matches k8s:ns:workloads plus k8s:sa:client.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: client
+  namespace: workloads
+---
+# The intruder. It has an entry, so it gets an SVID. The identity is not
+# spiffe://lab.local/client, so the API server refuses it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: intruder
+  namespace: workloads
+---
+# This service account gets no registration entry. A pod that uses it reaches
+# the Workload API, but the agent gives it no SVID.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: unregistered
+  namespace: workloads
