@@ -1,0 +1,66 @@
+# The API server workload: a Deployment and a Service.
+#
+# start-server.sh applies this file. The control plane comes up first, and
+# register.sh creates the entries first. The server then gets an identity as
+# soon as it starts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+  namespace: workloads
+spec:
+  selector:
+    app: server
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+  namespace: workloads
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: server
+  template:
+    metadata:
+      labels:
+        app: server
+    spec:
+      # The identity input. This name plus the namespace makes the two
+      # selectors of the registration entry.
+      serviceAccountName: server
+      containers:
+        - name: server
+          image: spire-k8s-lab-workload:1.15.2
+          # bootstrap.sh loads the image into the cluster. The node must not
+          # try to pull it from a registry.
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/server"]
+          # The image already uses this UID. The pod says it again, because
+          # the lab shows that all four workloads share one UID.
+          securityContext:
+            runAsUser: 10000
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/sockets/agent.sock
+          ports:
+            - name: https
+              containerPort: 8443
+          volumeMounts:
+            # Read-only: a workload connects to the socket, but it must not be
+            # able to delete or replace the socket for the other workloads.
+            - name: sockets
+              mountPath: /run/spire/sockets
+              readOnly: true
+      volumes:
+        # The agent DaemonSet makes this directory. Type "Directory" fails the
+        # pod if the agent is absent, which is the correct result.
+        - name: sockets
+          hostPath:
+            path: /run/spire/sockets
+            type: Directory

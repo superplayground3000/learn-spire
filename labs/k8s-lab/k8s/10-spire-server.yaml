@@ -1,0 +1,186 @@
+# The SPIRE server: RBAC, the trust bundle ConfigMap, the configuration, a
+# Service and a StatefulSet.
+#
+# The k8s_psat node attestor validates the projected token of the agent. That
+# needs three permissions on the cluster: get pods, get nodes, and create
+# tokenreviews.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-server
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spire-server
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: spire
+---
+# The k8sbundle notifier writes the trust bundle into the spire-bundle
+# ConfigMap. It patches one object in one namespace, so a Role is enough.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spire-bundle-writer
+  namespace: spire
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spire-bundle-writer
+  namespace: spire
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spire-bundle-writer
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: spire
+---
+# The notifier only patches this ConfigMap. It does not create it, so the
+# ConfigMap must exist first. It ships empty on purpose. The server fills the
+# key "bundle.crt" when it starts. The agent mounts the same ConfigMap, and it
+# reads the bundle before it attests.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-bundle
+  namespace: spire
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server-conf
+  namespace: spire
+data:
+  server.conf: |
+    server {
+        bind_address = "0.0.0.0"
+        bind_port    = "8081"
+        trust_domain = "lab.local"
+
+        # /var/lib/spire/server is one of the few directories the official
+        # scratch-based image ships owned by its default user (uid 1000).
+        data_dir  = "/var/lib/spire/server"
+        log_level = "DEBUG"
+
+        ca_ttl                = "24h"
+        default_x509_svid_ttl = "1h"
+    }
+
+    plugins {
+        DataStore "sql" {
+            plugin_data {
+                database_type     = "sqlite3"
+                connection_string = "/var/lib/spire/server/datastore.sqlite3"
+            }
+        }
+
+        # The headline delta of lab 3. In lab 2 an operator gave the agent a
+        # one-time join token. Here the agent presents a projected service
+        # account token, and the server validates it with a TokenReview.
+        # The allow list names the one service account that may attest.
+        NodeAttestor "k8s_psat" {
+            plugin_data {
+                clusters = {
+                    "lab-cluster" = {
+                        service_account_allow_list = ["spire:spire-agent"]
+                    }
+                }
+            }
+        }
+
+        # "disk" rather than "memory" so a server restart keeps the same CA and
+        # already-issued SVIDs stay verifiable.
+        KeyManager "disk" {
+            plugin_data {
+                keys_path = "/var/lib/spire/server/keys.json"
+            }
+        }
+
+        # This plugin writes the trust bundle into the spire-bundle ConfigMap.
+        # It replaces the bootstrap.crt copy step of lab 2.
+        Notifier "k8sbundle" {
+            plugin_data {}
+        }
+    }
+---
+# The agent finds the server at spire-server.spire:8081. Workloads never talk
+# to the server, so the Service stays inside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server
+  namespace: spire
+spec:
+  selector:
+    app: spire-server
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: spire
+spec:
+  serviceName: spire-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spire-server
+  template:
+    metadata:
+      labels:
+        app: spire-server
+    spec:
+      serviceAccountName: spire-server
+      # The image runs as uid 1000. fsGroup makes the emptyDir writable for
+      # the datastore and the CA keys.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: spire-server
+          image: ghcr.io/spiffe/spire-server:1.15.2
+          command:
+            - /opt/spire/bin/spire-server
+            - run
+            - -config
+            - /run/spire/config/server.conf
+          ports:
+            - name: grpc
+              containerPort: 8081
+          volumeMounts:
+            - name: conf
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/spire/server
+      volumes:
+        - name: conf
+          configMap:
+            name: spire-server-conf
+        # The datastore and the CA keys live here. "make lab-down" deletes the
+        # cluster, so nothing outlives the lab.
+        - name: data
+          emptyDir: {}

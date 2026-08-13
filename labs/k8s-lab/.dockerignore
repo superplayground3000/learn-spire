@@ -1,0 +1,8 @@
+# The build stages need only go.mod, go.sum and cmd/. Do not include the
+# other files. Do not include runtime material from tmp/.
+tmp/
+scripts/
+k8s/
+Makefile
+README.md
+.gitignore

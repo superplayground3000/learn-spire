@@ -1,0 +1,170 @@
+# The SPIRE agent: RBAC, the configuration, and a DaemonSet.
+#
+# The k8s workload attestor asks the kubelet /pods endpoint for the pod of the
+# caller. Under webhook authorization that request maps to get on nodes/proxy.
+# CAUTION: get on nodes/proxy also permits exec into any container on the
+# node. Grant it to the spire-agent service account only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-agent
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "nodes/proxy"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spire-agent
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent
+    namespace: spire
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-agent-conf
+  namespace: spire
+data:
+  agent.conf: |
+    agent {
+        data_dir     = "/var/lib/spire/agent"
+        log_level    = "DEBUG"
+        trust_domain = "lab.local"
+
+        # The Service of the SPIRE server. Workloads never learn this address.
+        # Only the agent talks to the server.
+        server_address = "spire-server"
+        server_port    = "8081"
+
+        # The Workload API endpoint. It sits in the hostPath directory
+        # /run/spire/sockets, so every workload pod on this node reaches it at
+        # SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/sockets/agent.sock
+        socket_path = "/run/spire/sockets/agent.sock"
+
+        # The agent must already trust the server's CA before it attests,
+        # otherwise the first connection can be intercepted. In lab 2 a script
+        # copied the bundle in. Here the k8sbundle notifier keeps the
+        # spire-bundle ConfigMap current, and the pod mounts it.
+        # insecure_bootstrap is deliberately NOT used.
+        trust_bundle_path = "/run/spire/bundle/bundle.crt"
+    }
+
+    plugins {
+        # The node attestor delta. The kubelet gives this pod a projected
+        # service account token. The agent presents it, and the server
+        # validates it. No operator mints a join token any more.
+        NodeAttestor "k8s_psat" {
+            plugin_data {
+                cluster = "lab-cluster"
+            }
+        }
+
+        KeyManager "disk" {
+            plugin_data {
+                directory = "/var/lib/spire/agent"
+            }
+        }
+
+        # The workload attestor delta. In lab 2 the docker plugin read the
+        # labels of the caller's container. Here the k8s plugin asks the
+        # kubelet for the pod of the caller. It produces k8s:ns: and k8s:sa:
+        # selectors, and more.
+        #
+        # The agent finds the pod of a caller in two steps. First it reads
+        # /proc/<pid>/cgroup or /proc/<pid>/mountinfo to get the container ID.
+        # Then it looks that ID up in the kubelet /pods list.
+        #
+        # kind (kubeadm) deploys a self-signed kubelet serving certificate.
+        # The cluster CA cannot verify it, so skip the verification.
+        # node_name_env names the variable that holds the kubelet address.
+        # The kubelet secure port 10250 and the service account token_path
+        # are defaults. Do not set them.
+        WorkloadAttestor "k8s" {
+            plugin_data {
+                skip_kubelet_verification = true
+                node_name_env             = "MY_NODE_NAME"
+            }
+        }
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spire-agent
+  namespace: spire
+spec:
+  selector:
+    matchLabels:
+      app: spire-agent
+  template:
+    metadata:
+      labels:
+        app: spire-agent
+    spec:
+      serviceAccountName: spire-agent
+      # hostPID: the attestor reads /proc/<pid>/ of the calling process. In its
+      # own PID namespace the agent cannot see a workload PID at all.
+      hostPID: true
+      # hostNetwork: the agent dials the kubelet at the node IP.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: spire-agent
+          image: ghcr.io/spiffe/spire-agent:1.15.2
+          command:
+            - /opt/spire/bin/spire-agent
+            - run
+            - -config
+            - /run/spire/config/agent.conf
+          # The agent reads /proc of other processes and writes the socket
+          # into a host directory. Both need root. Compare this with the
+          # workload pods: they run as UID 10000 with no other privilege.
+          securityContext:
+            runAsUser: 0
+          env:
+            # Under host networking the pod IP equals the node IP, which is
+            # the reliable kubelet address on kind.
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: conf
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: bundle
+              mountPath: /run/spire/bundle
+              readOnly: true
+            - name: sockets
+              mountPath: /run/spire/sockets
+            - name: token
+              mountPath: /var/run/secrets/tokens
+      volumes:
+        - name: conf
+          configMap:
+            name: spire-agent-conf
+        - name: bundle
+          configMap:
+            name: spire-bundle
+        # The Workload API socket lives on the node. Every workload pod mounts
+        # the same directory read-only.
+        - name: sockets
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        # The PSAT. The kubelet mints it and rotates it. No operator mints
+        # anything, and no token reaches the repository.
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: spire-agent
+                  expirationSeconds: 7200
+                  audience: spire-server
